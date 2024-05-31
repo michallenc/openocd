@@ -12,6 +12,9 @@
  * atsamv, atsams, and atsame support
  * Copyright (C) 2015 Morgan Quigley
  *
+ * atsamv extension of user signature area
+ * Copyright (C) 2024 Elektroline Inc.
+ *
  * Some of the lower level code was based on code supplied by
  * ATMEL under BSD-Source-Code License and this copyright.
  * ATMEL Microcontroller Software Support
@@ -23,7 +26,9 @@
 #endif
 
 #include "imp.h"
+#include <helper/configuration.h>
 #include <helper/time_support.h>
+#include <helper/bits.h>
 
 #define REG_NAME_WIDTH  (12)
 
@@ -40,6 +45,12 @@
 #define SAMV_EFC_FCMD_SFB    (0xB)	/* (EFC) Set Fuse Bit */
 #define SAMV_EFC_FCMD_CFB    (0xC)	/* (EFC) Clear Fuse Bit */
 #define SAMV_EFC_FCMD_GFB    (0xD)	/* (EFC) Get Fuse Bit */
+#define SAMV_EFC_FCMD_WUS    (0x12)	/* (EFC) Write User Signature */
+#define SAMV_EFC_FCMD_EUS    (0x13)	/* (EFC) Erase User Signature */
+#define SAMV_EFC_FCMD_STU    (0x14)	/* (EFC) Start Read User Signature */
+#define SAMV_EFC_FCMD_SPUS   (0x15)	/* (EFC) Stop Read User Signature */
+
+#define SAMV_EFC_FMR_SCOD BIT(16) /* Sequantial Code Optimalization Disable */
 
 #define OFFSET_EFC_FMR    0
 #define OFFSET_EFC_FCR    4
@@ -52,12 +63,21 @@
 #define SAMV_SECTOR_SIZE             16384
 #define SAMV_PAGE_SIZE                 512
 #define SAMV_FLASH_BASE         0x00400000
+/* This is a workaround. Flash Signature area is actually located at the
+ * beginning of the flash memory at the address range overlapping the
+ * first page of program flash. Since OpenOCD does not support write to
+ * a bank outside of address range, we use address above maximum 32-bit
+ * address space.
+ */
+#define SAMV_FLASH_SIGNATURE_BASE (0x100000000)
+#define SAMV_FLASH_SIGNATURE_SIZE (SAMV_PAGE_SIZE)
 
 struct samv_flash_bank {
 	bool      probed;
 	unsigned size_bytes;
 	unsigned gpnvm[SAMV_NUM_GPNVM_BITS];
 };
+
 
 /* The actual sector size of the SAMV7 flash memory is 128K bytes.
  * 16 sectors for a 2048KB device. The lock regions are 16KB per lock
@@ -72,6 +92,46 @@ static int samv_efc_get_status(struct target *target, uint32_t *v)
 	return r;
 }
 
+static int samv_efc_check_status(struct target *target, uint8_t desired)
+{
+	uint32_t v;
+	samv_efc_get_status(target, &v);
+	if ((v & 1) != desired)
+		return ERROR_FAIL;
+
+	return ERROR_OK;
+}
+
+static int samv_efc_wait_status(struct target *target, uint8_t desired,
+		int64_t timeout, uint32_t *status)
+{
+	uint32_t v;
+	int64_t ms_now, ms_end;
+	int r;
+
+	if (status)
+		*status = 0;
+
+	ms_end = timeout + timeval_ms();
+
+	do {
+		r = samv_efc_get_status(target, &v);
+		if (r != ERROR_OK)
+			return r;
+
+		if (status)
+			*status = v;
+		ms_now = timeval_ms();
+		if (ms_now > ms_end) {
+			/* error */
+			LOG_ERROR("Command timeout");
+			return ERROR_FAIL;
+		}
+	} while ((v & 1) != desired);
+
+	return ERROR_OK;
+}
+
 static int samv_efc_get_result(struct target *target, uint32_t *v)
 {
 	uint32_t rv;
@@ -81,15 +141,20 @@ static int samv_efc_get_result(struct target *target, uint32_t *v)
 	return r;
 }
 
+static inline int samv_efc_get_mode(struct target *target, uint32_t *v)
+{
+	return target_read_u32(target, SAMV_CONTROLLER_ADDR + OFFSET_EFC_FMR, v);
+}
+
+static inline int samv_efc_set_mode(struct target *target, uint32_t v)
+{
+	return target_write_u32(target, SAMV_CONTROLLER_ADDR + OFFSET_EFC_FMR, v);
+}
+
 static int samv_efc_start_command(struct target *target,
 		unsigned command, unsigned argument)
 {
 	uint32_t v;
-	samv_efc_get_status(target, &v);
-	if (!(v & 1)) {
-		LOG_ERROR("flash controller is not ready");
-		return ERROR_FAIL;
-	}
 
 	v = (0x5A << 24) | (argument << 8) | command;
 	LOG_DEBUG("starting flash command: 0x%08x", (unsigned int)(v));
@@ -104,33 +169,68 @@ static int samv_efc_perform_command(struct target *target,
 {
 	int r;
 	uint32_t v;
-	int64_t ms_now, ms_end;
 
 	if (status)
 		*status = 0;
 
+	r = samv_efc_check_status(target, 1);
+	if (r != ERROR_OK)
+		return r;
 	r = samv_efc_start_command(target, command, argument);
 	if (r != ERROR_OK)
 		return r;
 
-	ms_end = 10000 + timeval_ms();
-
-	do {
-		r = samv_efc_get_status(target, &v);
-		if (r != ERROR_OK)
-			return r;
-		ms_now = timeval_ms();
-		if (ms_now > ms_end) {
-			/* error */
-			LOG_ERROR("Command timeout");
-			return ERROR_FAIL;
-		}
-	} while ((v & 1) == 0);
+	r = samv_efc_wait_status(target, 1, 10000, &v);
+	if (r != ERROR_OK)
+		return r;
 
 	/* if requested, copy the flash controller error bits back to the caller */
 	if (status)
 		*status = (v & 0x6);
 	return ERROR_OK;
+}
+
+static int samv_efc_read_sequence(struct target *target, unsigned int start_cmd,
+		unsigned int stop_cmd, uint8_t *buf, size_t read_size)
+{
+	uint32_t v;
+	uint32_t addr = SAMV_FLASH_BASE;
+	int r;
+
+	samv_efc_get_mode(target, &v);
+	v |= SAMV_EFC_FMR_SCOD;
+	samv_efc_set_mode(target, v);
+
+	r = samv_efc_start_command(target, start_cmd, 0);
+	if (r != ERROR_OK)
+		return r;
+
+	r = samv_efc_wait_status(target, 0, 10000, NULL);
+	if (r != ERROR_OK)
+		goto rs_finish;
+
+	r = target_read_memory(target, addr, sizeof(uint32_t),
+			read_size / sizeof(uint32_t), buf);
+	if (r != ERROR_OK) {
+		LOG_ERROR("flash program failed to read page @ 0x%08x",
+							(unsigned int)(addr));
+		goto rs_finish;
+	}
+
+	r = samv_efc_start_command(target, stop_cmd, 0);
+	if (r != ERROR_OK)
+		return r;
+
+	r = samv_efc_wait_status(target, 1, 10000, NULL);
+	if (r != ERROR_OK)
+		goto rs_finish;
+
+rs_finish:
+	samv_efc_get_mode(target, &v);
+	v &= ~SAMV_EFC_FMR_SCOD;
+	samv_efc_set_mode(target, v);
+
+	return r;
 }
 
 static int samv_erase_pages(struct target *target,
@@ -230,6 +330,17 @@ static int samv_set_gpnvm(struct target *target, unsigned gpnvm)
 	return r;
 }
 
+static int samv_erase_user_signature(struct target *target)
+{
+	int r;
+
+	r = samv_efc_perform_command(target, SAMV_EFC_FCMD_EUS, 0, NULL);
+	if (r != ERROR_OK)
+		LOG_ERROR("error performing user signature write");
+
+	return r;
+}
+
 static int samv_flash_unlock(struct target *target,
 		unsigned start_sector, unsigned end_sector)
 {
@@ -306,6 +417,15 @@ static int samv_get_device_id(struct flash_bank *bank, uint32_t *device_id)
 
 static int samv_probe(struct flash_bank *bank)
 {
+	if (bank->bank_number == 1) {
+		bank->base = SAMV_FLASH_SIGNATURE_BASE;
+		bank->size = SAMV_FLASH_SIGNATURE_SIZE;
+		bank->num_sectors = 1;
+		bank->sectors = calloc(bank->num_sectors, sizeof(struct flash_sector));
+		bank->sectors[0].size = SAMV_FLASH_SIGNATURE_SIZE;
+		return ERROR_OK;
+	}
+
 	uint32_t device_id;
 	int r = samv_get_device_id(bank, &device_id);
 	if (r != ERROR_OK)
@@ -377,6 +497,9 @@ static int samv_erase(struct flash_bank *bank, unsigned int first,
 	if (r != ERROR_OK)
 		return r;
 
+	if (bank->base == SAMV_FLASH_SIGNATURE_BASE)
+		return samv_erase_user_signature(bank->target);
+
 	/* easy case: we've been requested to erase the entire flash */
 	if ((first == 0) && ((last + 1) == bank->num_sectors))
 		return samv_efc_perform_command(bank->target, SAMV_EFC_FCMD_EA, 0, NULL);
@@ -418,7 +541,7 @@ static int samv_protect(struct flash_bank *bank, int set, unsigned int first,
 	return r;
 }
 
-static int samv_page_read(struct target *target,
+static int samv_read_standard_page(struct target *target,
 		unsigned page_num, uint8_t *buf)
 {
 	uint32_t addr = SAMV_FLASH_BASE + page_num * SAMV_PAGE_SIZE;
@@ -429,8 +552,61 @@ static int samv_page_read(struct target *target,
 	return r;
 }
 
-static int samv_page_write(struct target *target,
-		unsigned pagenum, const uint8_t *buf)
+static int samv_read_user_signature(struct target *target,
+		unsigned int page_num, uint8_t *buf)
+{
+	int r;
+
+	r = samv_efc_read_sequence(target, SAMV_EFC_FCMD_STU, SAMV_EFC_FCMD_SPUS,
+			buf, SAMV_PAGE_SIZE);
+
+	return r;
+}
+
+static int samv_page_read(struct target *target,
+		target_addr_t base, unsigned int page_num, uint8_t *buf)
+{
+	int r;
+	if (base == SAMV_FLASH_SIGNATURE_BASE)
+		r = samv_read_user_signature(target, page_num, buf);
+	else
+		r = samv_read_standard_page(target, page_num, buf);
+
+	return r;
+}
+
+static int samv_write_user_signature(struct target *target,
+		unsigned int pagenum, const uint8_t *buf)
+{
+	const uint32_t addr = SAMV_FLASH_BASE;
+	int r;
+
+	/* We need to erase user signature before writing it. This is not described
+	 * in the datasheet, but the results are not correct unless erase is done
+	 * prior to write operation.
+	 */
+	r = samv_erase_user_signature(target);
+	if (r != ERROR_OK) {
+		LOG_ERROR("error performing user signature erase");
+		return r;
+	}
+
+	r = target_write_memory(target, addr, sizeof(uint32_t),
+			SAMV_PAGE_SIZE / sizeof(uint32_t), buf);
+	if (r != ERROR_OK) {
+		LOG_ERROR("failed to buffer page at 0x%08x", (unsigned int)addr);
+		return r;
+	}
+
+	r = samv_efc_perform_command(target, SAMV_EFC_FCMD_WUS, 0, NULL);
+	if (r != ERROR_OK)
+		LOG_ERROR("error performing user signature write");
+
+	return r;
+}
+
+static int samv_write_standard_page(struct target *target,
+		unsigned int pagenum, const uint8_t *buf)
 {
 	uint32_t status;
 	const uint32_t addr = SAMV_FLASH_BASE + pagenum * SAMV_PAGE_SIZE;
@@ -453,6 +629,113 @@ static int samv_page_write(struct target *target,
 	if (status & (1 << 1)) {
 		LOG_ERROR("flash command error at 0x%08x", (unsigned int)addr);
 		return ERROR_FAIL;
+	}
+	return ERROR_OK;
+}
+
+static int samv_page_write(struct target *target,
+		target_addr_t base, unsigned int pagenum, const uint8_t *buf)
+{
+	int r;
+	if (base == SAMV_FLASH_SIGNATURE_BASE)
+		r = samv_write_user_signature(target, pagenum, buf);
+	else
+		r = samv_write_standard_page(target, pagenum, buf);
+
+	return r;
+}
+
+static int samv_read(struct flash_bank *bank, uint8_t *buffer,
+		uint32_t offset, uint32_t count)
+{
+	int r;
+	struct target *target = bank->target;
+
+	LOG_DEBUG("%s: offset=0x%08" PRIx32 " count=0x%08" PRIx32,
+		  __func__, offset, count);
+
+	if (target->state != TARGET_HALTED) {
+		LOG_ERROR("Target not halted");
+		return ERROR_TARGET_NOT_HALTED;
+	}
+
+	if (offset + count > bank->size) {
+		LOG_WARNING("Reads past end of flash. Extra data discarded.");
+		count = bank->size - offset;
+	}
+
+	uint8_t pagebuffer[SAMV_PAGE_SIZE] = {0};
+	uint32_t page_cur = offset / SAMV_PAGE_SIZE;
+	uint32_t page_end = (offset + count - 1) / SAMV_PAGE_SIZE;
+	uint32_t page_offset;
+
+	LOG_DEBUG("offset: 0x%08x, count: 0x%08x", (unsigned int)(offset),
+						(unsigned int)(count));
+	LOG_DEBUG("page start: %d, page end: %d", (int)(page_cur), (int)(page_end));
+
+	/* handle special case - all one page. */
+	if (page_cur == page_end) {
+		LOG_DEBUG("special case, all in one page");
+		r = samv_page_read(bank->target, bank->base, page_cur, pagebuffer);
+		if (r != ERROR_OK)
+			return r;
+
+		page_offset = offset & (SAMV_PAGE_SIZE - 1);
+		memcpy(buffer, pagebuffer + page_offset, count);
+
+		if (r != ERROR_OK)
+			return r;
+		return ERROR_OK;
+	}
+
+	/* step 1) handle the non-aligned starting address */
+	page_offset = offset & (SAMV_PAGE_SIZE - 1);
+	if (page_offset) {
+		LOG_DEBUG("non-aligned start");
+		/* read the partial page... */
+		r = samv_page_read(bank->target, bank->base, page_cur, pagebuffer);
+		if (r != ERROR_OK)
+			return r;
+
+		/* ... and copy it to the buffer */
+		uint32_t n = SAMV_PAGE_SIZE - page_offset;
+		memcpy(buffer, pagebuffer + page_offset, n);
+
+		r = samv_page_write(bank->target, bank->base, page_cur, pagebuffer);
+		if (r != ERROR_OK)
+			return r;
+
+		count -= n;
+		offset += n;
+		buffer += n;
+		page_cur++;
+	}
+
+	/* By checking that offset is correct here, we also fix a clang warning */
+	assert(offset % SAMV_PAGE_SIZE == 0);
+
+	/* step 2) handle the full pages */
+	LOG_DEBUG("full page loop: cur=%d, end=%d, count = 0x%08x", (int)page_cur,
+						(int)page_end, (unsigned int)(count));
+
+	while ((page_cur < page_end) && (count >= SAMV_PAGE_SIZE)) {
+		r = samv_page_read(bank->target, bank->base, page_cur, pagebuffer);
+		if (r != ERROR_OK)
+			return r;
+		memcpy(buffer, pagebuffer, SAMV_PAGE_SIZE);
+		count -= SAMV_PAGE_SIZE;
+		buffer += SAMV_PAGE_SIZE;
+		page_cur += 1;
+	}
+
+	/* step 3) read final page, if it's partial (otherwise it's already done) */
+	if (count) {
+		LOG_DEBUG("final partial page, count = 0x%08x", (unsigned int)(count));
+		/* we have a partial page */
+		r = samv_page_read(bank->target, bank->base, page_cur, pagebuffer);
+		if (r != ERROR_OK)
+			return r;
+		memcpy(buffer, pagebuffer, count);
 	}
 	return ERROR_OK;
 }
@@ -497,14 +780,14 @@ static int samv_write(struct flash_bank *bank, const uint8_t *buffer,
 	/* handle special case - all one page. */
 	if (page_cur == page_end) {
 		LOG_DEBUG("special case, all in one page");
-		r = samv_page_read(bank->target, page_cur, pagebuffer);
+		r = samv_page_read(bank->target, bank->base, page_cur, pagebuffer);
 		if (r != ERROR_OK)
 			return r;
 
-		page_offset = offset & (SAMV_PAGE_SIZE-1);
+		page_offset = offset & (SAMV_PAGE_SIZE - 1);
 		memcpy(pagebuffer + page_offset, buffer, count);
 
-		r = samv_page_write(bank->target, page_cur, pagebuffer);
+		r = samv_page_write(bank->target, bank->base, page_cur, pagebuffer);
 		if (r != ERROR_OK)
 			return r;
 		return ERROR_OK;
@@ -515,7 +798,7 @@ static int samv_write(struct flash_bank *bank, const uint8_t *buffer,
 	if (page_offset) {
 		LOG_DEBUG("non-aligned start");
 		/* read the partial page */
-		r = samv_page_read(bank->target, page_cur, pagebuffer);
+		r = samv_page_read(bank->target, bank->base, page_cur, pagebuffer);
 		if (r != ERROR_OK)
 			return r;
 
@@ -523,11 +806,11 @@ static int samv_write(struct flash_bank *bank, const uint8_t *buffer,
 		uint32_t n = SAMV_PAGE_SIZE - page_offset;
 		memcpy(pagebuffer + page_offset, buffer, n);
 
-		r = samv_page_write(bank->target, page_cur, pagebuffer);
+		r = samv_page_write(bank->target, bank->base, page_cur, pagebuffer);
 		if (r != ERROR_OK)
 			return r;
 
-		count  -= n;
+		count -= n;
 		offset += n;
 		buffer += n;
 		page_cur++;
@@ -541,7 +824,7 @@ static int samv_write(struct flash_bank *bank, const uint8_t *buffer,
 			(int)page_cur, (int)page_end, (unsigned int)(count));
 
 	while ((page_cur < page_end) && (count >= SAMV_PAGE_SIZE)) {
-		r = samv_page_write(bank->target, page_cur, buffer);
+		r = samv_page_write(bank->target, bank->base, page_cur, buffer);
 		if (r != ERROR_OK)
 			return r;
 		count -= SAMV_PAGE_SIZE;
@@ -553,11 +836,11 @@ static int samv_write(struct flash_bank *bank, const uint8_t *buffer,
 	if (count) {
 		LOG_DEBUG("final partial page, count = 0x%08x", (unsigned int)(count));
 		/* we have a partial page */
-		r = samv_page_read(bank->target, page_cur, pagebuffer);
+		r = samv_page_read(bank->target, bank->base, page_cur, pagebuffer);
 		if (r != ERROR_OK)
 			return r;
 		memcpy(pagebuffer, buffer, count); /* data goes at start of page */
-		r = samv_page_write(bank->target, page_cur, pagebuffer);
+		r = samv_page_write(bank->target, bank->base, page_cur, pagebuffer);
 		if (r != ERROR_OK)
 			return r;
 	}
@@ -691,7 +974,7 @@ const struct flash_driver atsamv_flash = {
 	.erase = samv_erase,
 	.protect = samv_protect,
 	.write = samv_write,
-	.read = default_flash_read,
+	.read = samv_read,
 	.probe = samv_probe,
 	.auto_probe = samv_auto_probe,
 	.erase_check = default_flash_blank_check,
